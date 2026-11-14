@@ -17899,10 +17899,39 @@
 
         async function loadBackgroundItemsFromStorage() {
             try {
-                const dbItems = await getAllWFData(WF_BACKGROUND_STORE);
+                // ============================================================
+                // MOBILE vs DESKTOP STORE SELECTION
+                // ------------------------------------------------------------
+                // Desktop: user WF background uploads live in
+                //          WF_BACKGROUND_STORE ("backgrounds").
+                //
+                // Mobile : the slides dashboard merges city + background
+                //          into ONE container, so the WF Background tab is
+                //          the per-user upload point for both images and
+                //          videos. uploadBackgroundItem() writes them to
+                //          WF_MOBILE_BACKGROUND_STORE ("mobile_backgrounds").
+                //
+                // This function is the ONLY place that populates
+                // window.currentBackgroundItems — which both the count
+                // label and the delete list read from. So on mobile we
+                // must ALSO read the mobile store here, otherwise the
+                // uploaded items appear in the slideshow but never show
+                // up in the "Uploaded Backgrounds" list (and can't be
+                // deleted from it). Desktop is byte-identical: only
+                // WF_BACKGROUND_STORE is read.
+                // ============================================================
+                const __wfIsMobileBg = window.matchMedia('(max-width: 900px)').matches;
+
+                const dbItemsDesktop = await getAllWFData(WF_BACKGROUND_STORE);
+                const dbItemsMobile = __wfIsMobileBg
+                    ? await getAllWFData(WF_MOBILE_BACKGROUND_STORE)
+                    : [];
 
                 // Keep only actual user uploads (id starts with 'background_')
-                const userOnly = (dbItems || []).filter(x =>
+                const userOnlyDesktop = (dbItemsDesktop || []).filter(x =>
+                    x && x.id && typeof x.id === 'string' && x.id.startsWith('background_')
+                );
+                const userOnlyMobile = (dbItemsMobile || []).filter(x =>
                     x && x.id && typeof x.id === 'string' && x.id.startsWith('background_')
                 );
 
@@ -17924,11 +17953,26 @@
                     seenData.add(item.data);
                     merged.push(item);
                 };
-                userOnly.forEach(push);
+                userOnlyDesktop.forEach(push);
+                // Mobile-only second pool — desktop never reaches this.
+                userOnlyMobile.forEach(push);
                 (DEFAULT_BACKGROUND_ITEMS || []).forEach(push);
 
                 window.currentBackgroundItems = merged;
                 await initBackgroundSlideshow();
+
+                // Refresh the count label + delete list so the newly
+                // merged items are visible on mobile immediately.
+                try {
+                    if (typeof updateBackgroundCount === 'function') {
+                        updateBackgroundCount();
+                    }
+                } catch (e) { }
+                try {
+                    if (typeof renderBackgroundUploadedItems === 'function') {
+                        renderBackgroundUploadedItems();
+                    }
+                } catch (e) { }
             } catch (error) {
                 window.currentBackgroundItems = [...(DEFAULT_BACKGROUND_ITEMS || [])];
                 await initBackgroundSlideshow();
@@ -17990,8 +18034,63 @@
                     ? WF_MOBILE_BACKGROUND_STORE
                     : WF_BACKGROUND_STORE;
                 await saveWFData(__wfBgStore, itemId, backgroundItem);
+
+                // ============================================================
+                // PUSH INTO THE LIVE LIST IMMEDIATELY
+                // ------------------------------------------------------------
+                // saveWFData() writes to IndexedDB and the localStorage
+                // mirror, but it does NOT add the item to
+                // window.currentBackgroundItems. That array is what both
+                // the "N uploaded" count label AND the
+                // "Uploaded Backgrounds" delete list read from.
+                //
+                // Without this push, the mobile upload path ends with:
+                //   • the item playing in the slideshow (initBackground-
+                //     Slideshow reads directly from the store), BUT
+                //   • the count still showing "0 uploaded" and the list
+                //     still empty, because nothing repopulated
+                //     window.currentBackgroundItems.
+                //
+                // Pushing it here makes the count + list update on the
+                // same tick as the upload — no extra IndexedDB read, no
+                // race with any async store.
+                //
+                // De-dupe by id and data so a repeated upload of the
+                // same bytes never produces a phantom row.
+                // ============================================================
+                try {
+                    if (!Array.isArray(window.currentBackgroundItems)) {
+                        window.currentBackgroundItems = [];
+                    }
+                    const __exists = window.currentBackgroundItems.some(function (x) {
+                        return x && (x.id === itemId || x.data === backgroundItem.data);
+                    });
+                    if (!__exists) {
+                        window.currentBackgroundItems.unshift({
+                            id: itemId,
+                            type: backgroundItem.type,
+                            data: backgroundItem.data,
+                            origData: backgroundItem.origData || backgroundItem.data,
+                            timestamp: backgroundItem.timestamp,
+                            fileName: backgroundItem.fileName
+                        });
+                    }
+                } catch (e) { }
+
                 if (backgroundSlideshowInterval) { clearTimeout(backgroundSlideshowInterval); backgroundSlideshowInterval = null; }
                 initBackgroundSlideshow();
+
+                // Refresh the count label + delete list from the list we
+                // just updated. This is what was missing on mobile —
+                // without these two calls the UI shows "0 uploaded"
+                // even though the item is playing in the slideshow.
+                try {
+                    if (typeof updateBackgroundCount === 'function') updateBackgroundCount();
+                } catch (e) { }
+                try {
+                    if (typeof renderBackgroundUploadedItems === 'function') renderBackgroundUploadedItems();
+                } catch (e) { }
+
                 saveSlideSnapshot();
                 showSuccessNotification("Image Added", "Uploaded successfully!");
                 return true;
@@ -25006,7 +25105,20 @@
 
             window.deleteBackgroundItem = async function (itemId) {
                 if (confirm("Delete this background item?")) {
-                    await deleteWFData(WF_BACKGROUND_STORE, itemId);
+                    // ============================================================
+                    // VIEWPORT-AWARE STORE ROUTING
+                    // ------------------------------------------------------------
+                    // Mobile uploads go to WF_MOBILE_BACKGROUND_STORE; desktop
+                    // uploads go to WF_BACKGROUND_STORE. Try BOTH so the
+                    // delete always hits whichever store the item actually
+                    // lives in. deleteWFData() is a no-op if the id isn't
+                    // in that store, so running it twice is safe.
+                    // ============================================================
+                    const __wfIsMobileDel = window.matchMedia('(max-width: 900px)').matches;
+                    try { await deleteWFData(WF_BACKGROUND_STORE, itemId); } catch (e) { }
+                    if (__wfIsMobileDel) {
+                        try { await deleteWFData(WF_MOBILE_BACKGROUND_STORE, itemId); } catch (e) { }
+                    }
                     if (window.currentBackgroundItems) {
                         window.currentBackgroundItems = window.currentBackgroundItems.filter(item => item.id !== itemId);
                     }
